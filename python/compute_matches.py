@@ -16,8 +16,14 @@ from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing import image
 from tensorflow.keras import backend as K
 from tensorflow.keras.layers import Layer, Conv2D, MultiHeadAttention, LayerNormalization
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from multiprocessing import cpu_count
 import warnings
 warnings.filterwarnings('ignore')
+
+# Configure TensorFlow to use all CPU cores
+tf.config.threading.set_intra_op_parallelism_threads(cpu_count())
+tf.config.threading.set_inter_op_parallelism_threads(cpu_count())
 
 # ============================================================================
 # CUSTOM LAYERS DEFINITIONS (Required for model loading)
@@ -282,12 +288,15 @@ def accuracy_metric(y_true, y_pred):
 class PetMatchingEngine:
     """Engine to compute similarity matches using the trained Siamese model."""
     
-    def __init__(self, model_path, debug=False):
+    def __init__(self, model_path, debug=False, batch_size=32, num_workers=None):
         self.model_path = model_path
         self.debug = debug
         self.model = None
         self.embedding_model = None
         self.debug_info = []
+        self.batch_size = batch_size
+        self.num_workers = num_workers if num_workers else cpu_count()
+        self.log(f"Initialized with {self.num_workers} workers and batch size {self.batch_size}")
         
     def log(self, msg):
         """Log debug messages."""
@@ -386,6 +395,43 @@ class PetMatchingEngine:
         
         return embedding
     
+    def get_embeddings_batch(self, img_paths):
+        """Extract embeddings for multiple images in batch (faster)."""
+        if len(img_paths) == 0:
+            return np.array([]), []
+        
+        # Preprocess all images
+        img_arrays = []
+        valid_paths = []
+        for img_path in img_paths:
+            try:
+                img_array = self.preprocess_image(img_path)
+                img_arrays.append(img_array)
+                valid_paths.append(img_path)
+            except Exception as e:
+                self.log(f"Error preprocessing {img_path}: {str(e)}")
+                continue
+        
+        if len(img_arrays) == 0:
+            return np.array([]), []
+        
+        # Stack into batch
+        batch = np.vstack(img_arrays)
+        
+        # Get embeddings in batch
+        output = self.embedding_model.predict(batch, verbose=0, batch_size=self.batch_size)
+        
+        # Handle different output formats
+        if isinstance(output, list):
+            embeddings = output[1]
+        else:
+            embeddings = output
+        
+        # Flatten each embedding
+        embeddings = embeddings.reshape(embeddings.shape[0], -1)
+        
+        return embeddings, valid_paths
+    
     def cosine_similarity(self, vec1, vec2):
         """Compute cosine similarity between two vectors."""
         # Normalize vectors
@@ -427,6 +473,27 @@ class PetMatchingEngine:
         except Exception as e:
             self.log(f"Error generating thumbnail for {img_path}: {str(e)}")
             return None
+    
+    def generate_thumbnails_parallel(self, img_paths, size=(150, 150)):
+        """Generate thumbnails for multiple images in parallel."""
+        thumbnails = {}
+        
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            # Submit all thumbnail generation tasks
+            future_to_path = {executor.submit(self.generate_thumbnail, path, size): path 
+                             for path in img_paths}
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_path):
+                path = future_to_path[future]
+                try:
+                    thumb = future.result()
+                    thumbnails[path] = thumb
+                except Exception as e:
+                    self.log(f"Thumbnail generation failed for {path}: {str(e)}")
+                    thumbnails[path] = None
+        
+        return thumbnails
     
     def find_matches(self, query_image_path, gallery_dir, pet_types, top_k=10):
         """
@@ -482,39 +549,74 @@ class PetMatchingEngine:
         if len(gallery_images) == 0:
             raise Exception(f"No gallery images found in {gallery_dir}")
         
-        # Compute similarities
-        matches = []
-        for i, gallery_item in enumerate(gallery_images):
+        # Process gallery images in batches for efficiency
+        gallery_paths = [item['path'] for item in gallery_images]
+        gallery_embeddings_list = []
+        
+        self.log(f"Processing gallery images in batches of {self.batch_size}...")
+        
+        # Process in batches
+        for i in range(0, len(gallery_paths), self.batch_size):
+            batch_paths = gallery_paths[i:i + self.batch_size]
             try:
-                gallery_embedding = self.get_embedding(gallery_item['path'])
-                similarity = self.cosine_similarity(query_embedding, gallery_embedding)
+                batch_embeddings, valid_paths = self.get_embeddings_batch(batch_paths)
+                gallery_embeddings_list.extend(batch_embeddings)
                 
-                matches.append({
-                    'path': gallery_item['path'],
-                    'filename': gallery_item['filename'],
-                    'type': gallery_item['type'],
-                    'similarity': similarity,
-                    'distance': 1.0 - similarity  # Convert to distance
-                })
-                
-                if (i + 1) % 50 == 0:
-                    self.log(f"Processed {i + 1}/{len(gallery_images)} images")
-                    
+                self.log(f"Processed batch {i // self.batch_size + 1}/{(len(gallery_paths) + self.batch_size - 1) // self.batch_size}")
             except Exception as e:
-                self.log(f"Error processing {gallery_item['filename']}: {str(e)}")
-                continue
+                self.log(f"Error processing batch starting at index {i}: {str(e)}")
+                # Fallback to individual processing for this batch
+                for path in batch_paths:
+                    try:
+                        emb = self.get_embedding(path)
+                        gallery_embeddings_list.append(emb)
+                    except Exception as e2:
+                        self.log(f"Error processing {path}: {str(e2)}")
+                        continue
+        
+        if len(gallery_embeddings_list) == 0:
+            raise Exception("Failed to extract any gallery embeddings")
+        
+        self.log(f"Successfully extracted {len(gallery_embeddings_list)} embeddings")
+        
+        # Compute similarities using vectorized operations
+        gallery_embeddings = np.array(gallery_embeddings_list)
+        
+        # Normalize embeddings for cosine similarity
+        query_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-10)
+        gallery_norms = gallery_embeddings / (np.linalg.norm(gallery_embeddings, axis=1, keepdims=True) + 1e-10)
+        
+        # Compute all similarities at once (vectorized)
+        similarities = np.dot(gallery_norms, query_norm)
+        similarities = (similarities + 1.0) / 2.0  # Map from [-1, 1] to [0, 1]
+        
+        # Create matches list
+        matches = []
+        for i, (gallery_item, similarity) in enumerate(zip(gallery_images[:len(similarities)], similarities)):
+            matches.append({
+                'path': gallery_item['path'],
+                'filename': gallery_item['filename'],
+                'type': gallery_item['type'],
+                'similarity': float(similarity),
+                'distance': float(1.0 - similarity)
+            })
         
         self.log(f"Successfully computed {len(matches)} similarities")
         
         # Sort by similarity (descending)
         matches.sort(key=lambda x: x['similarity'], reverse=True)
         
-        # Get top-k matches with ranks and thumbnails
+        # Get top-k matches
+        top_k_matches = matches[:top_k]
+        
+        # Generate thumbnails in parallel for top-k matches
+        self.log(f"Generating thumbnails for top {top_k} matches in parallel...")
+        top_k_paths = [match['path'] for match in top_k_matches]
+        thumbnails = self.generate_thumbnails_parallel(top_k_paths)
+        
+        # Build final results with ranks and thumbnails
         top_matches = []
-        for rank, match in enumerate(matches[:top_k], start=1):
-            # Generate thumbnail
-            thumb_base64 = self.generate_thumbnail(match['path'])
-            
+        for rank, match in enumerate(top_k_matches, start=1):
             top_matches.append({
                 'rank': rank,
                 'path': match['path'],
@@ -522,7 +624,7 @@ class PetMatchingEngine:
                 'type': match['type'],
                 'similarity': match['similarity'],
                 'distance': match['distance'],
-                'thumb_base64': thumb_base64
+                'thumb_base64': thumbnails.get(match['path'])
             })
         
         self.log(f"Top match similarity: {top_matches[0]['similarity']:.4f}" if top_matches else "No matches")
@@ -563,8 +665,19 @@ def main():
     }
     
     try:
-        # Initialize engine
-        engine = PetMatchingEngine(model_path, debug=debug)
+        # Initialize engine with optimized settings
+        num_workers = cpu_count()
+        batch_size = min(32, max(8, num_workers * 2))  # Adaptive batch size
+        
+        engine = PetMatchingEngine(
+            model_path, 
+            debug=debug, 
+            batch_size=batch_size,
+            num_workers=num_workers
+        )
+        
+        if debug:
+            result['debug'].append(f"Using {num_workers} CPU cores with batch size {batch_size}")
         
         # Load model
         engine.load_model()
